@@ -4,7 +4,7 @@ A purpose-built raster-to-vector utility for Game Boy Camera art.
 Feed it low‑res 2‑bit images and it generates stroke‑only SVGs for pen plotters, with precise control over pixel scale and nib (pen) size. It also exports 1‑bit BMP masks per tonal layer.
 
 -------------------------------------------------------------------------------
-![App screenshot](https://github.com/MikeBeradino/gameboy_image_processing/blob/main/screengrab.png?raw=true)
+![alt text](https://github.com/MikeBeradino/gameboy_image_processing/blob/main/screengrab.png?raw=true)
 -------------------------------------------------------------------------------
 HIGHLIGHTS
 • Made for GBC: assumes 4 tones (black, dark gray, light gray, white). If your image isn’t exactly 4 levels, it auto‑clusters to four.
