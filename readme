@@ -1,0 +1,157 @@
+GBC Raster → Vector Plotter (Game Boy Camera)
+
+A purpose-built raster-to-vector utility for Game Boy Camera art.
+Feed it low‑res 2‑bit images and it generates stroke‑only SVGs for pen plotters, with precise control over pixel scale and nib (pen) size. It also exports 1‑bit BMP masks per tonal layer.
+
+-------------------------------------------------------------------------------
+SCREENSHOT
+Place your screen grab here and update any docs as needed:
+
+docs/screenshot.png   ← put your PNG/JPG here
+
+-------------------------------------------------------------------------------
+HIGHLIGHTS
+• Made for GBC: assumes 4 tones (black, dark gray, light gray, white). If your image isn’t exactly 4 levels, it auto‑clusters to four.
+• Plotter‑friendly vectors: no fills — strokes only for crisp edges and predictable ink.
+• Three vector styles:
+  - Horizontal hatch (0° lines)
+  - Vertical hatch (90° lines)
+  - Nested boxes per pixel
+    · Pen‑down (continuous): one spiral per pixel
+    · Pen‑lift (separate rings): fewer artifacts, more lifts
+• Linked scaling controls:
+  - Pixel size (mm/px) ↔ Canvas W/H (mm) stay in sync.
+• Nib size aware: you set the nib width (mm); paths inset by nib/2 for clean boundaries.
+• Organized output: per‑image folder with bmps/ and svgs/<mode>/, descriptive filenames.
+• Live previews: mask & SVG preview (~500 px) right in the app (requires Cairo).
+
+-------------------------------------------------------------------------------
+HOW IT WORKS (PIPELINE)
+1) Load an image (PNG/BMP/JPG/TIF…), convert to grayscale.
+2) Quantize to four tones (or accept the 4 present).
+3) Split into 4 binary layers labeled: deep, mid, light, white
+   Mapping (darkest → lightest): deep (most ink) → mid → light → white (ignored).
+4) Vectorize each non‑white layer using the chosen style (H/V hatch or Nested).
+5) Export:
+   • 1‑bit BMPs (black = ink, white = paper)
+   • SVGs sized in mm with a viewBox in pixel units (so stroke widths reflect real nib mm).
+
+-------------------------------------------------------------------------------
+INSTALLATION (COPY & PASTE)
+Python 3.9+ recommended.
+
+Virtual environment (optional):
+python -m venv .venv
+# macOS/Linux:
+source .venv/bin/activate
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+
+Python packages:
+pip install pillow numpy opencv-python svgwrite cairosvg
+
+Cairo for SVG preview:
+# macOS (Homebrew):
+brew install cairo
+# Ubuntu/Debian:
+sudo apt-get update
+sudo apt-get install -y libcairo2 libcairo2-dev python3-tk
+
+Note: SVGs are still written even if Cairo isn’t installed; only live preview needs it.
+
+-------------------------------------------------------------------------------
+QUICK START (COPY & PASTE)
+# Put your GBC images in a folder, for example:
+mkdir -p ~/gbc_inputs
+
+# Run the app (replace main.py with your script’s name if different):
+python main.py
+
+In the app:
+1) Set Folder and click Scan.
+2) Choose a File from the dropdown.
+3) Pick a Mode: Horizontal, Vertical, or Nested boxes.
+4) (Nested only) toggle “Pen lift between rings” if desired.
+5) Set Pixel size (mm/px) and Nib (mm).
+   • Canvas W/H auto‑update (and vice‑versa).
+6) Click ▶ Run (Generate outputs).
+
+-------------------------------------------------------------------------------
+OUTPUT LAYOUT
+For an input like blue.bmp you’ll get:
+out/blue/
+  bmps/
+    blue_deep_1bit.bmp
+    blue_mid_1bit.bmp
+    blue_light_1bit.bmp
+    blue_white_1bit.bmp
+  svgs/
+    horizontal/
+      blue_deep_horizontal_px-<P>mm_nib-<N>mm.svg
+      ...
+    vertical/
+      blue_mid_vertical_px-<P>mm_nib-<N>mm.svg
+      ...
+    nested_pen_down/
+      blue_light_nested_pen_down_px-<P>mm_nib-<N>mm.svg
+      ...
+    nested_pen_lift/
+      blue_deep_nested_pen_lift_px-<P>mm_nib-<N>mm.svg
+      ...
+  blue_preview_4level.png
+
+Filenames include the label, mode, pixel size, and nib for easy sorting.
+
+-------------------------------------------------------------------------------
+GUI CONTROLS
+• Mode
+  - Horizontal: stroke lines across each filled pixel; spacing = nib width.
+  - Vertical: stroke lines down each filled pixel; spacing = nib width.
+  - Nested boxes: concentric rectangles inside each pixel.
+    · Pen lift between rings:
+      · Off: one continuous path per pixel (center → rings with tiny bridges).
+      · On: one path per ring (controller handles travel between rings).
+• Pixel size (mm/px): physical size of one image pixel on paper.
+• Canvas W/H (mm): linked to pixel size and image dimensions.
+• Nib (mm): actual stroke width on paper. Geometry is inset by nib/2 to prevent bleed.
+
+-------------------------------------------------------------------------------
+LAYER NAMING (BRIGHTNESS → INK)
+We label by ink density (how much to draw), not source brightness.
+
+Source (bright → dark) → Label → Used for plotting
+• White → white → ignored (empty)
+• Light gray → light → light ink
+• Dark gray → mid → medium ink
+• Black → deep → most ink
+
+-------------------------------------------------------------------------------
+PLOTTING TIPS
+• Crisp edges: paths are inset nib/2 from pixel borders; butt caps and miter joins keep corners sharp.
+• How many hatch lines fit? Approx: floor((P - n)/n) + 1, where P = pixel size (mm) and n = nib (mm), assuming spacing = nib and nib/2 insets.
+• Nib > pixel size: the app still runs, but a pixel may not fit any hatch lines/rings — that layer may be empty.
+• Bleed compensation: if your ink spreads, reduce Pixel size slightly or over‑estimate Nib by your measured bleed.
+
+-------------------------------------------------------------------------------
+TROUBLESHOOTING
+• “SVG preview unavailable / Cairo not found”
+  Install Cairo (see Installation). Files still write to out/ even without preview.
+• No files in dropdown
+  Confirm your folder and that files end with: .png .bmp .gif .jpg .jpeg .tif .tiff
+• Preview scale
+  The preview auto‑scales to ~500 px max dimension; output SVG uses true mm.
+
+-------------------------------------------------------------------------------
+WHY THE SVG IS RELIABLE FOR PLOTTING
+• Units: SVG width/height are in millimeters (explicit physical size).
+  The viewBox uses pixel units, so stroke width in user units equals nib_mm / pixel_mm, guaranteeing the plotted line matches the nib you set.
+• No fills: stroke‑only marks avoid pooling and keep edges crisp.
+
+-------------------------------------------------------------------------------
+LICENSE
+MIT
+
+-------------------------------------------------------------------------------
+CREDITS
+Built for the Game Boy Camera community.
+Powered by Pillow, NumPy, OpenCV, svgwrite, CairoSVG, and tkinter.
