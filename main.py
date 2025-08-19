@@ -1,39 +1,37 @@
-# gbc_vector_gui_nodialog_strokes_scale_nib_penlift_labels_dirs_grouped.py
-# H/V hatch + Nested boxes; linked scaling (pixel mm <-> canvas W/H); nib (mm);
-# Pen-lift for nested; Labels deep/mid/light/white; NEW: per-mode SVG subfolders + descriptive filenames.
+# gbc_vector_gui.py
+# Game Boy Camera raster (2-bit) -> 1-bit masks + plotter-friendly SVGs.
+# Modes: Horizontal hatch, Vertical hatch, Nested boxes (pen down / pen lift), Dots.
+# Features: linked scaling (pixel mm <-> canvas W/H mm), nib mm, edge margin mm,
+# Zig-zag for H/V (serpentine within runs), CairoSVG preview (~500 px),
+# labeled layers (deep/mid/light/white), per-image output dirs with per-mode subfolders.
 
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import io, sys, os, re, xml.etree.ElementTree as ET
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw
-import cv2, svgwrite, tkinter as tk
+import svgwrite
+import tkinter as tk
 from tkinter import ttk, messagebox
 
-# ---- macOS Cairo auto-hint (for SVG preview via cairosvg) ----
+# ---------------- macOS Cairo hint (for preview) ----------------
 if sys.platform == "darwin" and "CAIRO" not in os.environ:
     for p in ("/opt/homebrew/opt/cairo/lib/libcairo.2.dylib",
-              "/usr/local/opt/cairo/lib/libcairo.2.dylylib",
               "/usr/local/opt/cairo/lib/libcairo.2.dylib"):
         if Path(p).exists():
             os.environ["CAIRO"] = p
             break
-# --------------------------------------------------------------
+# ----------------------------------------------------------------
 
 # ---------------- config ----------------
-# Tabs display order
 TONE_DISPLAY = ["deep", "mid", "light", "white"]
-
-# Correct mapping from darkest..lightest class index -> label
-# 0 = black  → deep (most ink)
-# 1 = dark g → mid
-# 2 = light g→ light
-# 3 = white  → white (ignored)
+# Darkest..lightest class index -> label
 IDX_TO_LABEL = {0: "deep", 1: "mid", 2: "light", 3: "white"}
 
 OUT_DIR = Path("./out"); OUT_DIR.mkdir(parents=True, exist_ok=True)
 PREVIEW_TARGET_PX = 500
 ALLOWED_EXTS = {".png", ".bmp", ".gif", ".jpg", ".jpeg", ".tif", ".tiff"}
+EPS = 1e-6
 # ---------------------------------------
 
 # -------------- core logic --------------
@@ -77,85 +75,188 @@ def save_1bit_bmp(mask: np.ndarray, path: Path):
 def _binary_runs_1d(vec: np.ndarray) -> List[Tuple[int, int]]:
     runs = []; in_run = False; start = 0
     for i, v in enumerate(vec):
-        if v and not in_run: in_run = True; start = i
-        elif (not v) and in_run: runs.append((start, i - 1)); in_run = False
+        if v and not in_run:
+            in_run = True; start = i
+        elif (not v) and in_run:
+            runs.append((start, i - 1)); in_run = False
     if in_run: runs.append((start, len(vec) - 1))
     return runs
 
-# ---- H/V hatch (scaled, nib-aware) ----
-def stroke_hatch_horizontal_svg(mask: np.ndarray, svg_path: Path, pixel_mm: float, nib_mm: float):
+# ---- Dots mode ----
+def stroke_dots_svg(mask: np.ndarray, svg_path: Path, pixel_mm: float, nib_mm: float, dot_mm: float):
+    """
+    One tiny horizontal segment (length = dot_mm) centered in each filled pixel.
+    Stroke width = nib_mm (scaled into user units).
+    """
     h, w = mask.shape
     nib_u = nib_mm / pixel_mm
-    r_u   = (nib_mm / 2.0) / pixel_mm
-    spacing = nib_u
+    half_dot_u = max(1e-6, 0.5 * (dot_mm / pixel_mm))  # clamp to something > 0
 
     dwg = svgwrite.Drawing(str(svg_path),
                            size=(f"{w*pixel_mm}mm", f"{h*pixel_mm}mm"),
-                           profile="tiny"); dwg.viewbox(0, 0, w, h)
+                           profile="tiny")
+    dwg.viewbox(0, 0, w, h)
     dwg.add(dwg.rect(insert=(0, 0), size=(w, h), fill="white"))
 
     for j in range(h):
-        y0 = j + r_u; y1 = (j + 1) - r_u
-        if y1 <= y0: continue
-        k = 0; row = mask[j, :]; runs = _binary_runs_1d(row)
-        while True:
-            y = y0 + k * spacing
-            if y > y1 + 1e-9: break
-            seq = runs if (k % 2 == 0) else reversed(runs)
-            for (x_start, x_end) in seq:
-                xL = x_start + r_u; xR = (x_end + 1) - r_u
-                if xR > xL:
-                    dwg.add(dwg.line((xL, y), (xR, y),
-                                     stroke="black", stroke_width=nib_u,
-                                     stroke_linecap="butt"))
-            k += 1
+        row = mask[j, :]
+        xs = np.where(row == 1)[0]
+        if xs.size == 0:
+            continue
+        y = j + 0.5
+        for i in xs:
+            cx = i + 0.5
+            dwg.add(dwg.line((cx - half_dot_u, y), (cx + half_dot_u, y),
+                             stroke="black",
+                             stroke_width=nib_u,
+                             stroke_linecap="butt"))  # butt keeps marks tight
     svg_path.parent.mkdir(parents=True, exist_ok=True)
     dwg.save()
 
-def stroke_hatch_vertical_svg(mask: np.ndarray, svg_path: Path, pixel_mm: float, nib_mm: float):
+# -------- H/V hatch (constant lines per pixel, overlap allowed, edge margin, zig-zag) --------
+def stroke_hatch_horizontal_svg(mask, svg_path, pixel_mm, nib_mm, edge_mm, zigzag):
+    import svgwrite
     h, w = mask.shape
-    nib_u = nib_mm / pixel_mm
-    r_u   = (nib_mm / 2.0) / pixel_mm
-    spacing = nib_u
+    nib_u  = nib_mm  / pixel_mm
+    edge_u = min(0.5, max(0.0, edge_mm / pixel_mm))   # inset left/right
+    N      = max(1, int(np.ceil(pixel_mm / nib_mm)))  # lines per pixel (allow overlap)
+    s      = 1.0 / N                                  # vertical spacing between line centers
 
     dwg = svgwrite.Drawing(str(svg_path),
                            size=(f"{w*pixel_mm}mm", f"{h*pixel_mm}mm"),
-                           profile="tiny"); dwg.viewbox(0, 0, w, h)
+                           profile="tiny")
+    dwg.viewbox(0, 0, w, h)
     dwg.add(dwg.rect(insert=(0, 0), size=(w, h), fill="white"))
 
-    for i in range(w):
-        x0 = i + r_u; x1 = (i + 1) - r_u
-        if x1 <= x0: continue
-        k = 0; col = mask[:, i]; runs = _binary_runs_1d(col)
-        while True:
-            x = x0 + k * spacing
-            if x > x1 + 1e-9: break
-            seq = runs if (k % 2 == 0) else reversed(runs)
-            for (y_start, y_end) in seq:
-                yT = y_start + r_u; yB = (y_end + 1) - r_u
-                if yB > yT:
-                    dwg.add(dwg.line((x, yT), (x, yB),
-                                     stroke="black", stroke_width=nib_u,
+    def row_segments(vec):
+        segs = []
+        in_run = False; start = 0
+        for i, v in enumerate(vec):
+            if v and not in_run:
+                in_run = True; start = i
+            elif (not v) and in_run:
+                xL = start + edge_u; xR = i - edge_u
+                if xR > xL + EPS: segs.append((xL, xR))
+                in_run = False
+        if in_run:
+            xL = start + edge_u; xR = len(vec) - edge_u
+            if xR > xL + EPS: segs.append((xL, xR))
+        return segs
+
+    for j in range(h):
+        segs = row_segments(mask[j, :])
+        if not segs: continue
+        y_centers = [j + (k + 0.5) * s for k in range(N)]
+        if not zigzag:
+            for k, y in enumerate(y_centers):
+                seq = segs if (k % 2 == 0) else [(b, a) for (a, b) in segs[::-1]]
+                for (xL, xR) in seq:
+                    dwg.add(dwg.line((xL, y), (xR, y),
+                                     stroke="black",
+                                     stroke_width=nib_u,
                                      stroke_linecap="butt"))
-            k += 1
+        else:
+            for (xL, xR) in segs:
+                d = [f"M {xL:.6f} {y_centers[0]:.6f}",
+                     f"L {xR:.6f} {y_centers[0]:.6f}"]
+                at_right = True
+                for k in range(1, N):
+                    yk = y_centers[k]
+                    if at_right:
+                        d.append(f"L {xR:.6f} {yk:.6f}")
+                        d.append(f"L {xL:.6f} {yk:.6f}")
+                    else:
+                        d.append(f"L {xL:.6f} {yk:.6f}")
+                        d.append(f"L {xR:.6f} {yk:.6f}")
+                    at_right = not at_right
+                dwg.add(dwg.path(" ".join(d),
+                                 fill="none",
+                                 stroke="black",
+                                 stroke_width=nib_u,
+                                 stroke_linecap="butt"))
     svg_path.parent.mkdir(parents=True, exist_ok=True)
     dwg.save()
 
-# ---- Nested boxes (scaled, nib-aware) ----
-def _ring_offsets_units_for_pixel(pixel_mm: float, nib_mm: float) -> List[float]:
+def stroke_hatch_vertical_svg(mask, svg_path, pixel_mm, nib_mm, edge_mm, zigzag):
+    import svgwrite
+    h, w = mask.shape
+    nib_u  = nib_mm  / pixel_mm
+    edge_u = min(0.5, max(0.0, edge_mm / pixel_mm))   # inset top/bottom
+    N      = max(1, int(np.ceil(pixel_mm / nib_mm)))
+    s      = 1.0 / N                                  # horizontal spacing between line centers
+
+    dwg = svgwrite.Drawing(str(svg_path),
+                           size=(f"{w*pixel_mm}mm", f"{h*pixel_mm}mm"),
+                           profile="tiny")
+    dwg.viewbox(0, 0, w, h)
+    dwg.add(dwg.rect(insert=(0, 0), size=(w, h), fill="white"))
+
+    def col_segments(vec):
+        segs = []
+        in_run = False; start = 0
+        for j, v in enumerate(vec):
+            if v and not in_run:
+                in_run = True; start = j
+            elif (not v) and in_run:
+                yT = start + edge_u; yB = j - edge_u
+                if yB > yT + EPS: segs.append((yT, yB))
+                in_run = False
+        if in_run:
+            yT = start + edge_u; yB = len(vec) - edge_u
+            if yB > yT + EPS: segs.append((yT, yB))
+        return segs
+
+    for i in range(w):
+        segs = col_segments(mask[:, i])
+        if not segs: continue
+        x_centers = [i + (k + 0.5) * s for k in range(N)]
+        if not zigzag:
+            for k, x in enumerate(x_centers):
+                seq = segs if (k % 2 == 0) else [(b, a) for (a, b) in segs[::-1]]
+                for (yT, yB) in seq:
+                    dwg.add(dwg.line((x, yT), (x, yB),
+                                     stroke="black",
+                                     stroke_width=nib_u,
+                                     stroke_linecap="butt"))
+        else:
+            for (yT, yB) in segs:
+                d = [f"M {x_centers[0]:.6f} {yT:.6f}",
+                     f"L {x_centers[0]:.6f} {yB:.6f}"]
+                at_bottom = True
+                for k in range(1, N):
+                    xk = x_centers[k]
+                    if at_bottom:
+                        d.append(f"L {xk:.6f} {yB:.6f}")
+                        d.append(f"L {xk:.6f} {yT:.6f}")
+                    else:
+                        d.append(f"L {xk:.6f} {yT:.6f}")
+                        d.append(f"L {xk:.6f} {yB:.6f}")
+                    at_bottom = not at_bottom
+                dwg.add(dwg.path(" ".join(d),
+                                 fill="none",
+                                 stroke="black",
+                                 stroke_width=nib_u,
+                                 stroke_linecap="butt"))
+    svg_path.parent.mkdir(parents=True, exist_ok=True)
+    dwg.save()
+
+# ---- Nested boxes (nib-aware, fallback when nib > 0.5*pixel) ----
+def _ring_offsets_units_for_pixel(pixel_mm: float, nib_mm: float, allow_edge_touch: bool = False) -> List[float]:
     nib_u = nib_mm / pixel_mm
     r_u   = (nib_mm / 2.0) / pixel_mm
     P_u   = 1.0
+    o = r_u + (0.0 if allow_edge_touch else nib_u / 2.0)
     offsets = []
-    o = r_u
     while True:
         w = P_u - 2.0 * o
-        if w < nib_u - 1e-9: break
-        offsets.append(o); o += nib_u
+        if w < 0.0: break
+        offsets.append(o)
+        o += nib_u
+    if not offsets and allow_edge_touch and nib_u < 1.0:
+        offsets = [r_u]
     return offsets
 
 def _append_rect_loop_path(d: List[str], xL: float, xR: float, yT: float, yB: float, xc: float):
-    # Loop around rect and return to top-center (xc, yT)
     d.append(f"L {xR:.6f} {yT:.6f}")
     d.append(f"L {xR:.6f} {yB:.6f}")
     d.append(f"L {xL:.6f} {yB:.6f}")
@@ -168,23 +269,24 @@ def stroke_nested_boxes_svg(mask: np.ndarray, svg_path: Path, pixel_mm: float, n
 
     dwg = svgwrite.Drawing(str(svg_path),
                            size=(f"{w*pixel_mm}mm", f"{h*pixel_mm}mm"),
-                           profile="tiny"); dwg.viewbox(0, 0, w, h)
+                           profile="tiny")
+    dwg.viewbox(0, 0, w, h)
     dwg.add(dwg.rect(insert=(0, 0), size=(w, h), fill="white"))
 
-    base_offsets = _ring_offsets_units_for_pixel(pixel_mm, nib_mm)
+    edge_touch = (nib_u > 0.5 + 1e-9)
+    base_offsets = _ring_offsets_units_for_pixel(pixel_mm, nib_mm, allow_edge_touch=edge_touch)
+    join_style = "bevel" if edge_touch else "miter"
 
     for j in range(h):
         row = mask[j, :]
         for i, v in enumerate(row):
             if not v or not base_offsets: continue
             offsets = list(reversed(base_offsets))  # inside→out default
-
             def ring_rect(o: float) -> Tuple[float, float, float, float]:
                 return i + o, (i + 1) - o, j + o, (j + 1) - o
             xc, yc = i + 0.5, j + 0.5
 
             if pen_lift:
-                # Separate path per ring (no connectors)
                 for o in offsets:
                     xL, xR, yT, yB = ring_rect(o)
                     d = [f"M {xc:.6f} {yT:.6f}",
@@ -195,9 +297,8 @@ def stroke_nested_boxes_svg(mask: np.ndarray, svg_path: Path, pixel_mm: float, n
                          f"L {xc:.6f} {yT:.6f}"]
                     dwg.add(dwg.path(" ".join(d), fill="none", stroke="black",
                                      stroke_width=nib_u, stroke_linecap="butt",
-                                     stroke_linejoin="miter", stroke_miterlimit=2))
+                                     stroke_linejoin=join_style, stroke_miterlimit=2))
             else:
-                # One continuous spiral per pixel
                 d: List[str] = [f"M {xc:.6f} {yc:.6f}"]
                 o0 = offsets[0]; xL, xR, yT, yB = ring_rect(o0)
                 d.append(f"L {xc:.6f} {yT:.6f}")
@@ -208,21 +309,20 @@ def stroke_nested_boxes_svg(mask: np.ndarray, svg_path: Path, pixel_mm: float, n
                     _append_rect_loop_path(d, xL, xR, yT, yB, xc)
                 dwg.add(dwg.path(" ".join(d), fill="none", stroke="black",
                                  stroke_width=nib_u, stroke_linecap="butt",
-                                 stroke_linejoin="miter", stroke_miterlimit=2))
+                                 stroke_linejoin=join_style, stroke_miterlimit=2))
     svg_path.parent.mkdir(parents=True, exist_ok=True)
     dwg.save()
 
 # ---------------------------------------
 
 def _fmt_mm(v: float) -> str:
-    """Format mm numbers for filenames (short, readable)."""
     s = f"{v:.3f}".rstrip("0").rstrip(".")
-    if s == "": s = "0"
-    return s
+    return s if s else "0"
 
-def process_image_file(path: str, mode: str, pixel_mm: float, nib_mm: float, pen_lift: bool):
+def process_image_file(path: str, mode: str, pixel_mm: float, nib_mm: float,
+                       pen_lift: bool, edge_mm: float, zigzag: bool, dot_mm: float):
     """
-    mode ∈ {"Horizontal","Vertical","Nested boxes"}.
+    mode ∈ {"Horizontal","Vertical","Nested boxes","Dots"}.
     Returns (results, wpx, hpx, base_dir).
     """
     stem = Path(path).stem
@@ -238,43 +338,52 @@ def process_image_file(path: str, mode: str, pixel_mm: float, nib_mm: float, pen
     bmps_dir.mkdir(parents=True, exist_ok=True)
     svgs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Decide SVG mode subfolder + mode tag for filenames
+    # SVG subfolder + mode tag for filenames
     if mode == "Horizontal":
-        svg_mode_dir = svgs_dir / "horizontal"
-        mode_tag = "horizontal"
+        svg_mode_dir = svgs_dir / "horizontal"; mode_tag = "horizontal"
     elif mode == "Vertical":
-        svg_mode_dir = svgs_dir / "vertical"
-        mode_tag = "vertical"
-    else:  # Nested boxes
+        svg_mode_dir = svgs_dir / "vertical"; mode_tag = "vertical"
+    elif mode == "Dots":
+        svg_mode_dir = svgs_dir / "dots"; mode_tag = "dots"
+    else:
         if pen_lift:
-            svg_mode_dir = svgs_dir / "nested_pen_lift"
-            mode_tag = "nested_pen_lift"
+            svg_mode_dir = svgs_dir / "nested_pen_lift"; mode_tag = "nested_pen_lift"
         else:
-            svg_mode_dir = svgs_dir / "nested_pen_down"
-            mode_tag = "nested_pen_down"
+            svg_mode_dir = svgs_dir / "nested_pen_down"; mode_tag = "nested_pen_down"
     svg_mode_dir.mkdir(parents=True, exist_ok=True)
 
-    px_tag = f"px-{_fmt_mm(pixel_mm)}mm"
-    nib_tag = f"nib-{_fmt_mm(nib_mm)}mm"
+    px_tag   = f"px-{_fmt_mm(pixel_mm)}mm"
+    nib_tag  = f"nib-{_fmt_mm(nib_mm)}mm"
+    edge_tag = f"edge-{_fmt_mm(edge_mm)}mm" if mode in ("Horizontal", "Vertical") else None
+    zz_tag   = "zigzag" if (mode in ("Horizontal","Vertical") and zigzag) else None
+    dot_tag  = f"dot-{_fmt_mm(dot_mm)}mm" if mode == "Dots" else None
 
     results = []
     for i in range(4):
-        label = IDX_TO_LABEL[i]  # "deep"|"mid"|"light"|"white"
+        label = IDX_TO_LABEL[i]
         mask = masks[i]
 
-        # filenames
         bmp_path = bmps_dir / f"{stem}_{label}_1bit.bmp"
-        svg_name = f"{stem}_{label}_{mode_tag}_{px_tag}_{nib_tag}.svg"
+
+        name_parts = [stem, label, mode_tag, px_tag, nib_tag]
+        if edge_tag: name_parts.append(edge_tag)
+        if zz_tag:   name_parts.append(zz_tag)
+        if dot_tag:  name_parts.append(dot_tag)
+        svg_name = "_".join(name_parts) + ".svg"
         svg_path = svg_mode_dir / svg_name
 
-        # write BMP 1-bit
+        # write BMP
         save_1bit_bmp(mask, bmp_path)
 
-        # write SVG
+        # write SVG by mode
         if mode == "Horizontal":
-            stroke_hatch_horizontal_svg(mask, svg_path, pixel_mm=pixel_mm, nib_mm=nib_mm)
+            stroke_hatch_horizontal_svg(mask, svg_path, pixel_mm=pixel_mm, nib_mm=nib_mm,
+                                        edge_mm=edge_mm, zigzag=zigzag)
         elif mode == "Vertical":
-            stroke_hatch_vertical_svg(mask, svg_path, pixel_mm=pixel_mm, nib_mm=nib_mm)
+            stroke_hatch_vertical_svg(mask, svg_path, pixel_mm=pixel_mm, nib_mm=nib_mm,
+                                      edge_mm=edge_mm, zigzag=zigzag)
+        elif mode == "Dots":
+            stroke_dots_svg(mask, svg_path, pixel_mm=pixel_mm, nib_mm=nib_mm, dot_mm=dot_mm)
         else:
             stroke_nested_boxes_svg(mask, svg_path, pixel_mm=pixel_mm, nib_mm=nib_mm, pen_lift=pen_lift)
 
@@ -290,8 +399,10 @@ def process_image_file(path: str, mode: str, pixel_mm: float, nib_mm: float, pen
 
 # -------- SVG → PIL (preview ~500px) --------
 def _parse_svg_size(svg_bytes: bytes) -> tuple[Optional[float], Optional[float]]:
-    try: root = ET.fromstring(svg_bytes)
-    except Exception: return (None, None)
+    try:
+        root = ET.fromstring(svg_bytes)
+    except Exception:
+        return (None, None)
     w_attr = root.get("width"); h_attr = root.get("height")
     def _f(s: Optional[str]) -> Optional[float]:
         if not s: return None
@@ -314,8 +425,10 @@ def _scale_to_max(img: Image.Image, target: int, resample=Image.NEAREST) -> Imag
     return img.resize((max(1, int(round(w*r))), max(1, int(round(h*r)))), resample)
 
 def render_svg_to_pillow(svg_path: Path) -> Image.Image:
-    try: import cairosvg
-    except ImportError: raise RuntimeError("Install cairosvg for SVG preview: pip install cairosvg")
+    try:
+        import cairosvg
+    except ImportError:
+        raise RuntimeError("Install cairosvg for SVG preview: pip install cairosvg")
     svg_bytes = svg_path.read_bytes()
     w, h = _parse_svg_size(svg_bytes)
     if w and h and w > 0 and h > 0:
@@ -332,7 +445,7 @@ def render_svg_to_pillow(svg_path: Path) -> Image.Image:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("GBC--->Vector")
+        self.title("GBC → 1-bit masks → SVG (H/V/Nested/Dots) + Scaling + Nib + Edge + Zig-zag + Pen-lift")
         self.geometry("1140x980"); self.minsize(940, 780)
 
         # state
@@ -350,11 +463,16 @@ class App(tk.Tk):
         self.canvas_h_var = tk.StringVar(value="")
         self._link_guard = False
 
-        # nib (mm)
+        # nib (mm), edge margin (mm), dot length (mm)
         self.nib_mm_var = tk.StringVar(value="0.3")
+        self.edge_mm_var = tk.StringVar(value="")      # blank = auto nib/2
+        self.dot_mm_var  = tk.StringVar(value="0.005") # tiny move for dots
 
         # nested option: pen lift between rings
         self.nested_pen_lift = tk.BooleanVar(value=False)
+
+        # zig-zag option for H/V
+        self.zigzag = tk.BooleanVar(value=True)
 
         # current image size
         self._wpx = None; self._hpx = None
@@ -375,29 +493,50 @@ class App(tk.Tk):
 
         modebar = ttk.Frame(self, padding=(8, 0)); modebar.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(modebar, text="Mode:").pack(side=tk.LEFT)
-        self.dir_combo = ttk.Combobox(modebar, state="readonly", width=18,
-                                      values=["Horizontal", "Vertical", "Nested boxes"],
+        self.dir_combo = ttk.Combobox(modebar, state="readonly", width=20,
+                                      values=["Horizontal", "Vertical", "Nested boxes", "Dots"],
                                       textvariable=self.mode)
         self.dir_combo.pack(side=tk.LEFT, padx=6); self.dir_combo.current(0)
 
-        nested_opt = ttk.Frame(self, padding=(8, 0)); nested_opt.pack(side=tk.TOP, fill=tk.X)
-        ttk.Checkbutton(nested_opt, text="Pen lift between rings (Nested)",
-                        variable=self.nested_pen_lift).pack(side=tk.LEFT)
+        opts = ttk.Frame(self, padding=(8, 0)); opts.pack(side=tk.TOP, fill=tk.X)
+        ttk.Checkbutton(opts, text="Zig-zag (connect within runs)", variable=self.zigzag).pack(side=tk.LEFT)
+        ttk.Checkbutton(opts, text="Pen lift between rings (Nested)", variable=self.nested_pen_lift).pack(side=tk.LEFT, padx=(12,0))
 
         scale = ttk.Frame(self, padding=(8, 2)); scale.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(scale, text="Pixel size (mm/px):").grid(row=0, column=0, sticky="w")
         self.pixel_entry = ttk.Entry(scale, width=10, textvariable=self.pixel_mm_var)
         self.pixel_entry.grid(row=0, column=1, padx=(4, 16), sticky="w")
+
         ttk.Label(scale, text="Canvas W (mm):").grid(row=0, column=2, sticky="w")
         self.canvas_w_entry = ttk.Entry(scale, width=10, textvariable=self.canvas_w_var)
         self.canvas_w_entry.grid(row=0, column=3, padx=(4, 16), sticky="w")
+
         ttk.Label(scale, text="Canvas H (mm):").grid(row=0, column=4, sticky="w")
         self.canvas_h_entry = ttk.Entry(scale, width=10, textvariable=self.canvas_h_var)
         self.canvas_h_entry.grid(row=0, column=5, padx=(4, 16), sticky="w")
+
         ttk.Label(scale, text="Nib (mm):").grid(row=0, column=6, sticky="w")
         self.nib_entry = ttk.Entry(scale, width=8, textvariable=self.nib_mm_var)
-        self.nib_entry.grid(row=0, column=7, padx=(4, 0), sticky="w")
+        self.nib_entry.grid(row=0, column=7, padx=(4, 12), sticky="w")
 
+        ttk.Label(scale, text="Edge margin (mm):").grid(row=0, column=8, sticky="w")
+        self.edge_entry = ttk.Entry(scale, width=10, textvariable=self.edge_mm_var)
+        self.edge_entry.grid(row=0, column=9, padx=(4, 0), sticky="w")
+
+        ttk.Label(scale, text="Dot length (mm):").grid(row=0, column=10, sticky="w")
+        self.dot_entry = ttk.Entry(scale, width=10, textvariable=self.dot_mm_var)
+        self.dot_entry.grid(row=0, column=11, padx=(4, 0), sticky="w")
+
+        # auto-fill edge = nib/2 if left blank when nib changes
+        def _maybe_autofill_edge(*_):
+            val = (self.edge_mm_var.get() or "").strip()
+            nib = self.parse_float(self.nib_mm_var.get())
+            if (not val) and nib:
+                self.edge_mm_var.set(f"{nib/2:.3f}")
+        self.nib_entry.bind("<FocusOut>", _maybe_autofill_edge)
+        self.nib_entry.bind("<Return>",   _maybe_autofill_edge)
+
+        # link updates
         self.pixel_entry.bind("<FocusOut>", lambda e: self._scale_from("pixel"))
         self.pixel_entry.bind("<Return>",   lambda e: self._scale_from("pixel"))
         self.canvas_w_entry.bind("<FocusOut>", lambda e: self._scale_from("cw"))
@@ -429,6 +568,13 @@ class App(tk.Tk):
             v = float(s); return v if v > 0 else None
         except ValueError: return None
 
+    def _edge_mm(self) -> float:
+        v = self.parse_float(self.edge_mm_var.get())
+        if v is not None:
+            return max(0.0, v)
+        nib = self.parse_float(self.nib_mm_var.get()) or 0.3
+        return nib / 2.0
+
     def _scale_from(self, source: str):
         if self._wpx is None or self._hpx is None or self._link_guard: return
         self._link_guard = True
@@ -448,7 +594,7 @@ class App(tk.Tk):
                 self.canvas_w_var.set(f"{wpx*P:.3f}")
             P_final = self.parse_float(self.pixel_mm_var.get())
             if P_final:
-                self.size_label.config(text=f"Image: {wpx}×{hpx} px  |  Pixel size: {P_final:.4g} mm/px  |  Output: {wpx*P_final:.2f} × {hpx*P_final:.2f} mm")
+                self.size_label.config(text=f"Image: {wpx}×{hpx} px  |  Pixel: {P_final:.4g} mm/px  |  Output: {wpx*P_final:.2f} × {hpx*P_final:.2f} mm")
         finally:
             self._link_guard = False
 
@@ -479,20 +625,24 @@ class App(tk.Tk):
     def on_process(self):
         if not self.selected_path:
             messagebox.showwarning("No file", "Pick an image from the File dropdown."); return
-        P   = self.parse_float(self.pixel_mm_var.get()) or 1.0
-        nib = self.parse_float(self.nib_mm_var.get()) or 0.3
-        if nib > P:
-            self.status.config(text=f"Note: nib {nib:.3g} mm > pixel {P:.3g} mm — some pixels may fit no strokes/rings.")
+        P     = self.parse_float(self.pixel_mm_var.get()) or 1.0
+        nib   = self.parse_float(self.nib_mm_var.get()) or 0.3
+        edge  = self._edge_mm()
+        zz    = bool(self.zigzag.get())
+        dotmm = self.parse_float(self.dot_mm_var.get()) or 0.005
+        if nib > P and self.mode.get() != "Dots":
+            self.status.config(text=f"Note: nib {nib:.3g} mm > pixel {P:.3g} mm — some pixels may fit no hatch/rings.")
         try:
             self.status.config(text="Processing… (writing BMP+SVG into /out/<name>/bmps and /svgs/<mode>)"); self.update_idletasks()
             results, wpx, hpx, base_dir = process_image_file(
                 str(self.selected_path),
                 mode=self.mode.get(),
                 pixel_mm=P, nib_mm=nib,
-                pen_lift=self.nested_pen_lift.get()
+                pen_lift=self.nested_pen_lift.get(),
+                edge_mm=edge, zigzag=zz, dot_mm=dotmm
             )
             self.update_previews(results)
-            self.size_label.config(text=f"Image: {wpx}×{hpx} px  |  Pixel: {P:.4g} mm  |  Nib: {nib:.4g} mm  |  Output: {wpx*P:.2f} × {hpx*P:.2f} mm  |  Dir: {base_dir.resolve()}")
+            self.size_label.config(text=f"Image: {wpx}×{hpx} px  |  Pixel: {P:.4g} mm  |  Nib: {nib:.4g} mm  |  Edge: {edge:.4g} mm  |  Dot: {dotmm:.4g} mm  |  Zig-zag: {zz}  |  Output: {wpx*P:.2f} × {hpx*P:.2f} mm  |  Dir: {base_dir.resolve()}")
             self.status.config(text=f"Done. Outputs in {base_dir.resolve()}")
         except Exception as e:
             messagebox.showerror("Error", str(e)); self.status.config(text=f"Error: {e}")
